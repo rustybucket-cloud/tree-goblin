@@ -21,6 +21,23 @@ go install .        # installs to ~/go/bin (must be on PATH)
 | `r`       | refresh                                            |
 | `q`       | quit                                               |
 
+## CLI
+
+Every TUI action is also available as a subcommand (no TUI is opened).
+`<worktree>` is a branch name, path, or worktree directory name.
+
+```sh
+tree-goblin list [--json]                          # list worktrees
+tree-goblin new <branch> [--base <ref>] [--path <dir>]  # create; prints the path
+tree-goblin rm <worktree> [-b|--branch] [-f|--force]    # remove (-b also deletes branch)
+tree-goblin open <worktree>                        # run the open command
+tree-goblin path <worktree>                        # print path, e.g. cd "$(tree-goblin path foo)"
+tree-goblin config [<command>] [--global] [--unset]     # show/set the open command
+tree-goblin prune                                  # prune stale entries
+```
+
+Aliases: `ls`, `add`, `remove`/`delete`. Errors exit 1; bad arguments exit 2.
+
 ## New worktrees
 
 - Existing local branch → checked out.
