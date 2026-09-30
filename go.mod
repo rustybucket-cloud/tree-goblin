@@ -1,4 +1,4 @@
-module tree-goblin
+module github.com/rustybucket-cloud/tree-goblin
 
 go 1.25.3
 

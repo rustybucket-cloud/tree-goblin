@@ -5,8 +5,10 @@ A TUI for managing git worktrees. Run it from inside any repo.
 ## Install
 
 ```sh
-go install .        # installs to ~/go/bin (must be on PATH)
+go install github.com/rustybucket-cloud/tree-goblin@latest   # installs to ~/go/bin (must be on PATH)
 ```
+
+Or from a clone: `go install .`
 
 ## Keys
 
@@ -61,3 +63,7 @@ nvim .
 claude
 tmux new-window -c {path} -n {name}
 ```
+
+## License
+
+MIT
