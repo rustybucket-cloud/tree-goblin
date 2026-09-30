@@ -23,17 +23,18 @@ type cli struct {
 }
 
 var commands = map[string]func(*cli, []string) error{
-	"list":   (*cli).list,
-	"ls":     (*cli).list,
-	"new":    (*cli).add,
-	"add":    (*cli).add,
-	"rm":     (*cli).remove,
-	"remove": (*cli).remove,
-	"delete": (*cli).remove,
-	"open":   (*cli).open,
-	"path":   (*cli).path,
-	"config": (*cli).config,
-	"prune":  (*cli).prune,
+	"list":      (*cli).list,
+	"ls":        (*cli).list,
+	"new":       (*cli).add,
+	"add":       (*cli).add,
+	"rm":        (*cli).remove,
+	"remove":    (*cli).remove,
+	"delete":    (*cli).remove,
+	"open":      (*cli).open,
+	"path":      (*cli).path,
+	"config":    (*cli).config,
+	"prune":     (*cli).prune,
+	"fix-links": (*cli).fixLinks,
 }
 
 // run executes a CLI subcommand and returns the process exit status.
@@ -94,16 +95,17 @@ func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 }
 
 type worktreeJSON struct {
-	Path     string `json:"path"`
-	Branch   string `json:"branch"`
-	Head     string `json:"head"`
-	Main     bool   `json:"main"`
-	Current  bool   `json:"current"`
-	Detached bool   `json:"detached"`
-	Bare     bool   `json:"bare"`
-	Locked   bool   `json:"locked"`
-	Prunable bool   `json:"prunable"`
-	Dirty    int    `json:"dirty"`
+	Path     string   `json:"path"`
+	Branch   string   `json:"branch"`
+	Head     string   `json:"head"`
+	Main     bool     `json:"main"`
+	Current  bool     `json:"current"`
+	Detached bool     `json:"detached"`
+	Bare     bool     `json:"bare"`
+	Locked   bool     `json:"locked"`
+	Prunable bool     `json:"prunable"`
+	Dirty    int      `json:"dirty"`
+	Links    []string `json:"links"`
 }
 
 func (c *cli) isCurrent(wt Worktree) bool {
@@ -127,7 +129,7 @@ func (c *cli) list(args []string) error {
 		out := make([]worktreeJSON, len(wts))
 		for i, wt := range wts {
 			out[i] = worktreeJSON{wt.Path, wt.Branch, wt.Head, wt.Main, c.isCurrent(wt),
-				wt.Detached, wt.Bare, wt.Locked, wt.Prunable, wt.Dirty}
+				wt.Detached, wt.Bare, wt.Locked, wt.Prunable, wt.Dirty, wt.Links}
 		}
 		enc := json.NewEncoder(c.out)
 		enc.SetIndent("", "  ")
@@ -151,6 +153,9 @@ func (c *cli) list(args []string) error {
 		}
 		if wt.Prunable {
 			f = append(f, "missing")
+		}
+		if len(wt.Links) > 0 {
+			f = append(f, fmt.Sprintf("links:%d", len(wt.Links)))
 		}
 		head := wt.Head
 		if len(head) > 7 {
@@ -190,7 +195,11 @@ func (c *cli) add(args []string) error {
 		return err
 	}
 	fmt.Fprintln(c.out, p)
-	return nil
+	copied, err := c.repo.Setup(Worktree{Path: p, Branch: branch}, c.repo.SourcePath(wts), c.err)
+	for _, rel := range copied {
+		fmt.Fprintln(c.err, "Copied", rel)
+	}
+	return err
 }
 
 func (c *cli) remove(args []string) error {
@@ -252,8 +261,9 @@ func (c *cli) open(args []string) error {
 	if wt.Prunable || wt.Bare {
 		return errors.New("can't open a bare or missing worktree")
 	}
-	cmd, _ := c.repo.OpenCommand()
-	proc := OpenExec(cmd, wt)
+	cmd, _ := c.repo.Config(openKey)
+	wts, _ := c.repo.List()
+	proc := OpenExec(cmd, wt, c.repo.SourcePath(wts))
 	proc.Stdin, proc.Stdout, proc.Stderr = os.Stdin, c.out, c.err
 	if err := proc.Run(); err != nil {
 		if proc.ProcessState != nil {
@@ -284,23 +294,32 @@ func (c *cli) path(args []string) error {
 func (c *cli) config(args []string) error {
 	fs := c.flags("config")
 	global := fs.Bool("global", false, "write to global git config instead of the repo")
-	unset := fs.Bool("unset", false, "clear the open command")
+	unset := fs.Bool("unset", false, "clear the command")
+	postCreate := fs.Bool("post-create", false, "show/set the post-create hook instead of the open command")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
+	}
+	key := openKey
+	if *postCreate {
+		key = postCreateKey
 	}
 	switch {
 	case *unset:
 		if len(pos) > 0 {
 			return usageErr("--unset takes no command")
 		}
-		return c.repo.SetOpenCommand("", *global)
+		return c.repo.SetConfig(key, "", *global)
 	case len(pos) > 0:
-		return c.repo.SetOpenCommand(strings.Join(pos, " "), *global)
+		return c.repo.SetConfig(key, strings.Join(pos, " "), *global)
 	}
-	cmd, scope := c.repo.OpenCommand()
+	cmd, scope := c.repo.Config(key)
 	if cmd == "" {
-		fmt.Fprintln(c.err, "no open command set ($SHELL is used)")
+		if *postCreate {
+			fmt.Fprintln(c.err, "no post-create hook set")
+		} else {
+			fmt.Fprintln(c.err, "no open command set ($SHELL is used)")
+		}
 		return nil
 	}
 	fmt.Fprintf(c.out, "%s\t(%s)\n", cmd, scope)
@@ -315,6 +334,34 @@ func (c *cli) prune(args []string) error {
 		return usageErr("unexpected argument %q", pos[0])
 	}
 	return c.repo.Prune()
+}
+
+func (c *cli) fixLinks(args []string) error {
+	fs := c.flags("fix-links")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return usageErr("expected a worktree (branch, path or directory name)")
+	}
+	wt, err := c.find(pos[0])
+	if err != nil {
+		return err
+	}
+	if len(wt.Links) == 0 {
+		fmt.Fprintln(c.err, "no symlinks point outside", wt.Path)
+		return nil
+	}
+	var errs []error
+	for _, rel := range wt.Links {
+		if err := FixLink(wt.Path, rel); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", rel, err))
+			continue
+		}
+		fmt.Fprintln(c.err, "Cloned", rel)
+	}
+	return errors.Join(errs...)
 }
 
 // find resolves arg to a worktree by branch name, path, or directory name.

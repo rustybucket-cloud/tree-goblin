@@ -71,7 +71,57 @@ func TestCLIConfig(t *testing.T) {
 		t.Fatalf("got %q", out)
 	}
 	runCLI(t, r, "config", "--unset")
-	if c, _ := r.OpenCommand(); c != "" {
+	if c, _ := r.Config(openKey); c != "" {
 		t.Fatalf("expected unset, got %q", c)
+	}
+}
+
+func TestCLISetupAndFixLinks(t *testing.T) {
+	r := setupRepo(t)
+	main := r.Current
+	os.WriteFile(filepath.Join(main, ".gitignore"), []byte("node_modules\n.env\n"), 0o644)
+	os.WriteFile(filepath.Join(main, ".worktreeinclude"), []byte("# deps\nnode_modules/\n.env\nmissing\n"), 0o644)
+	os.MkdirAll(filepath.Join(main, "node_modules", "pkg"), 0o755)
+	os.WriteFile(filepath.Join(main, "node_modules", "pkg", "index.js"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(main, ".env"), []byte("A=1"), 0o644)
+	git(main, "add", ".gitignore", ".worktreeinclude")
+	git(main, "commit", "-qm", "ignore")
+
+	runCLI(t, r, "config", "--post-create", "echo", "{branch}", ">", "hook.txt")
+	if out, _, _ := runCLI(t, r, "config", "--post-create"); !strings.HasPrefix(out, "echo {branch} > hook.txt") {
+		t.Fatalf("config: %q", out)
+	}
+
+	out, stderr, code := runCLI(t, r, "new", "feat/z")
+	wt := strings.TrimSpace(out)
+	if code != 0 {
+		t.Fatalf("new: %s", stderr)
+	}
+	if fi, err := os.Lstat(filepath.Join(wt, "node_modules")); err != nil || !fi.IsDir() {
+		t.Fatalf("node_modules not cloned: %v", err)
+	}
+	for f, want := range map[string]string{"node_modules/pkg/index.js": "x", ".env": "A=1", "hook.txt": "feat/z\n"} {
+		if b, _ := os.ReadFile(filepath.Join(wt, f)); string(b) != want {
+			t.Fatalf("%s = %q", f, b)
+		}
+	}
+
+	// a symlinked node_modules pointing back at main is flagged and fixable
+	os.RemoveAll(filepath.Join(wt, "node_modules"))
+	os.Symlink(filepath.Join(main, "node_modules"), filepath.Join(wt, "node_modules"))
+	out, _, _ = runCLI(t, r, "list", "--json")
+	var wts []worktreeJSON
+	json.Unmarshal([]byte(out), &wts)
+	if len(wts) != 2 || !reflect.DeepEqual(wts[1].Links, []string{"node_modules"}) || wts[0].Links != nil {
+		t.Fatalf("links: %s", out)
+	}
+	if _, stderr, code := runCLI(t, r, "fix-links", "feat/z"); code != 0 {
+		t.Fatalf("fix-links: %s", stderr)
+	}
+	if fi, err := os.Lstat(filepath.Join(wt, "node_modules")); err != nil || !fi.IsDir() {
+		t.Fatalf("still a symlink: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(wt, "node_modules", "pkg", "index.js")); string(b) != "x" {
+		t.Fatal("clone missing contents")
 	}
 }

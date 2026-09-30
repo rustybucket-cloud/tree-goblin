@@ -67,23 +67,30 @@ func TestLifecycle(t *testing.T) {
 
 func TestOpenCommandConfig(t *testing.T) {
 	r := setupRepo(t)
-	if c, _ := r.OpenCommand(); c != "" {
+	if c, _ := r.Config(openKey); c != "" {
 		t.Fatalf("expected empty, got %q", c)
 	}
-	r.SetOpenCommand("code {path}", true)
-	r.SetOpenCommand("nvim .", false)
-	if c, s := r.OpenCommand(); c != "nvim ." || s != "local" {
+	r.SetConfig(openKey, "code {path}", true)
+	r.SetConfig(openKey, "nvim .", false)
+	if c, s := r.Config(openKey); c != "nvim ." || s != "local" {
 		t.Fatalf("got %q %q", c, s)
 	}
-	r.SetOpenCommand("", false)
-	if c, s := r.OpenCommand(); c != "code {path}" || s != "global" {
+	r.SetConfig(openKey, "", false)
+	if c, s := r.Config(openKey); c != "code {path}" || s != "global" {
 		t.Fatalf("got %q %q", c, s)
 	}
 }
 
 func TestOpenExec(t *testing.T) {
-	c := OpenExec("echo {path} {branch}", Worktree{Path: "/a b/it's", Branch: "x"})
+	c := OpenExec("echo {path} {branch}", Worktree{Path: "/a b/it's", Branch: "x"}, "/m")
 	if got := c.Args[2]; got != `echo '/a b/it'\''s' 'x'` {
 		t.Fatalf("got %s", got)
+	}
+}
+
+func TestParseStatus(t *testing.T) {
+	dirty, ignored := parseStatus("R  new\x00old\x00?? a b\x00!! node_modules/\x00!! .env\x00")
+	if dirty != 2 || len(ignored) != 2 || ignored[0] != "node_modules/" || ignored[1] != ".env" {
+		t.Fatalf("got %d %q", dirty, ignored)
 	}
 }

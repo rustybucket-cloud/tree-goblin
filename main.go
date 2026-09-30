@@ -19,18 +19,26 @@ Usage: run inside a git repository.
                                    branch, -f forces both)
   tree-goblin open <worktree>      run the open command in a worktree
   tree-goblin path <worktree>      print a worktree's path
-  tree-goblin config [<command>] [--global] [--unset]
-                                   show or set the open command
+  tree-goblin config [--post-create] [<command>] [--global] [--unset]
+                                   show or set the open command (or the
+                                   post-create hook)
+  tree-goblin fix-links <worktree> replace ignored symlinks pointing outside
+                                   the worktree with copy-on-write clones
   tree-goblin prune                prune stale worktree entries
 
 <worktree> is a branch name, path, or worktree directory name.
 
 TUI keys: ↑/↓ move, enter open, n new, d delete, c set open command,
-          p prune, r refresh, q quit
+          h set post-create hook, l fix links, p prune, r refresh, q quit
 
-The open command is stored in git config (` + configKey + `),
-per repo or globally. Placeholders: {path} {branch} {name}.
-With no command set, $SHELL is started in the worktree.
+The open command (` + openKey + `) and post-create hook
+(` + postCreateKey + `) are stored in git config, per repo or globally.
+Placeholders: {path} {branch} {name} {main}. With no open command set,
+$SHELL is started in the worktree.
+
+New worktrees get copy-on-write clones of the paths listed in the main
+worktree's ` + includeFile + ` (one path or glob per line), then the
+post-create hook runs inside the new worktree.
 `
 
 func main() {

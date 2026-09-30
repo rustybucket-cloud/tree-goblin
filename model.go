@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,6 +22,7 @@ const (
 	modeConfirmForce
 	modeConfirmBranchForce
 	modeSetCommand
+	modeConfirmFixLinks
 )
 
 type (
@@ -28,8 +31,10 @@ type (
 		err  error
 	}
 	createdMsg struct {
-		path string
-		err  error
+		path     string
+		err      error
+		copied   []string
+		setupErr error
 	}
 	removedMsg struct {
 		force bool
@@ -39,8 +44,9 @@ type (
 		force bool
 		err   error
 	}
-	openedMsg struct{ err error }
-	prunedMsg struct{ err error }
+	openedMsg     struct{ err error }
+	prunedMsg     struct{ err error }
+	linksFixedMsg struct{ err error }
 )
 
 const (
@@ -65,12 +71,15 @@ type model struct {
 
 	openCmd   string
 	openScope string
+	hookCmd   string
+	hookScope string
 
 	inputs     []textinput.Model
 	focus      int
 	pathEdited bool
 
 	cmdInput  textinput.Model
+	cmdKey    string // config key being edited in modeSetCommand
 	cmdGlobal bool
 
 	target    Worktree
@@ -102,11 +111,11 @@ func newModel(repo *Repo) model {
 	}
 	ci := textinput.New()
 	ci.Prompt = ""
-	ci.Placeholder = "e.g. code {path}   (blank = $SHELL)"
 	ci.CharLimit = 1024
 
 	m := model{repo: repo, inputs: inputs, cmdInput: ci, busy: true}
-	m.openCmd, m.openScope = repo.OpenCommand()
+	m.openCmd, m.openScope = repo.Config(openKey)
+	m.hookCmd, m.hookScope = repo.Config(postCreateKey)
 	return m
 }
 
@@ -132,6 +141,8 @@ func (m model) mainPath() string {
 	}
 	return m.repo.Current
 }
+
+func (m model) sourcePath() string { return m.repo.SourcePath(m.worktrees) }
 
 func (m *model) setStatus(s string, isErr bool) {
 	m.status, m.statusErr = s, isErr
@@ -176,7 +187,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.mode = modeList
 		m.selectPath = msg.path
-		m.setStatus("Created "+m.displayPath(msg.path), false)
+		status := "Created " + m.displayPath(msg.path)
+		if len(msg.copied) > 0 {
+			status += fmt.Sprintf(", copied %d path(s)", len(msg.copied))
+		}
+		if msg.setupErr != nil {
+			m.setStatus(status+"; "+lastLine(msg.setupErr.Error()), true)
+		} else {
+			m.setStatus(status, false)
+		}
 		m.busy = true
 		return m, m.load()
 
@@ -222,6 +241,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setStatus("open command failed: "+msg.err.Error(), true)
 		}
 		m.busy = true
+		return m, m.load()
+
+	case linksFixedMsg:
+		m.mode = modeList
+		if msg.err != nil {
+			m.setStatus(msg.err.Error(), true)
+		} else {
+			m.setStatus(fmt.Sprintf("Replaced %d symlink(s) with clones", len(m.target.Links)), false)
+		}
 		return m, m.load()
 
 	case prunedMsg:
@@ -283,7 +311,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.setStatus("", false)
-		return m, tea.ExecProcess(OpenExec(m.openCmd, wt), func(err error) tea.Msg { return openedMsg{err} })
+		return m, tea.ExecProcess(OpenExec(m.openCmd, wt, m.sourcePath()), func(err error) tea.Msg { return openedMsg{err} })
 
 	case "n", "a":
 		m.mode = modeCreate
@@ -313,11 +341,29 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.setStatus("", false)
 		}
 
-	case "c":
+	case "l":
+		wt, ok := m.selected()
+		if !ok || len(wt.Links) == 0 {
+			m.setStatus("No symlinks point outside this worktree", false)
+			return m, nil
+		}
+		m.target = wt
+		m.mode = modeConfirmFixLinks
+		m.setStatus("", false)
+
+	case "c", "h":
 		m.mode = modeSetCommand
-		m.cmdInput.SetValue(m.openCmd)
+		val, scope := m.openCmd, m.openScope
+		m.cmdKey = openKey
+		m.cmdInput.Placeholder = "e.g. code {path}   (blank = $SHELL)"
+		if msg.String() == "h" {
+			val, scope = m.hookCmd, m.hookScope
+			m.cmdKey = postCreateKey
+			m.cmdInput.Placeholder = "e.g. cp -cR {main}/node_modules .   (blank = none)"
+		}
+		m.cmdInput.SetValue(val)
 		m.cmdInput.CursorEnd()
-		m.cmdGlobal = m.openScope == "global"
+		m.cmdGlobal = scope == "global"
 		m.setStatus("", false)
 		return m, tea.Batch(m.cmdInput.Focus(), textinput.Blink)
 	}
@@ -349,7 +395,18 @@ func (m model) updateCreate(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		path = ResolvePath(path, m.mainPath())
 		m.busy = true
 		m.setStatus("Creating worktree…", false)
-		return m, func() tea.Msg { return createdMsg{path, m.repo.Add(path, branch, base)} }
+		src := m.sourcePath()
+		return m, func() tea.Msg {
+			if err := m.repo.Add(path, branch, base); err != nil {
+				return createdMsg{path: path, err: err}
+			}
+			var out bytes.Buffer
+			copied, err := m.repo.Setup(Worktree{Path: path, Branch: branch}, src, &out)
+			if err != nil && out.Len() > 0 {
+				err = fmt.Errorf("%w: %s", err, lastLine(out.String()))
+			}
+			return createdMsg{path: path, copied: copied, setupErr: err}
+		}
 	}
 
 	var cmd tea.Cmd
@@ -386,16 +443,21 @@ func (m model) updateSetCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		cmd := strings.TrimSpace(m.cmdInput.Value())
-		if err := m.repo.SetOpenCommand(cmd, m.cmdGlobal); err != nil {
+		if err := m.repo.SetConfig(m.cmdKey, cmd, m.cmdGlobal); err != nil {
 			m.setStatus(err.Error(), true)
 			return m, nil
 		}
-		m.openCmd, m.openScope = m.repo.OpenCommand()
+		m.openCmd, m.openScope = m.repo.Config(openKey)
+		m.hookCmd, m.hookScope = m.repo.Config(postCreateKey)
 		m.mode = modeList
+		what := "open command"
+		if m.cmdKey == postCreateKey {
+			what = "post-create hook"
+		}
 		if cmd == "" {
-			m.setStatus("Cleared open command", false)
+			m.setStatus("Cleared "+what, false)
 		} else {
-			m.setStatus("Saved open command", false)
+			m.setStatus("Saved "+what, false)
 		}
 		return m, nil
 	}
@@ -443,6 +505,21 @@ func (m model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.busy = true
 			return m, m.deleteBranch(true)
 		}
+	case modeConfirmFixLinks:
+		if key == "y" {
+			m.busy = true
+			m.setStatus("Cloning…", false)
+			wt := m.target
+			return m, func() tea.Msg {
+				var errs []error
+				for _, rel := range wt.Links {
+					if err := FixLink(wt.Path, rel); err != nil {
+						errs = append(errs, fmt.Errorf("%s: %w", rel, err))
+					}
+				}
+				return linksFixedMsg{errors.Join(errs...)}
+			}
+		}
 	}
 	return m, nil
 }
@@ -462,7 +539,11 @@ func (m model) listHeight() int {
 	if m.height == 0 {
 		return 20
 	}
-	return max(m.height-8, 3)
+	h := m.height - 8
+	if m.hookCmd != "" {
+		h--
+	}
+	return max(h, 3)
 }
 
 func (m *model) clampScroll() {
@@ -482,10 +563,14 @@ func (m model) View() string {
 	name := strings.TrimSuffix(filepath.Base(m.mainPath()), ".git")
 	b.WriteString(titleStyle.Render("🌳 tree-goblin") + dimStyle.Render("  "+name) + "\n")
 	if m.openCmd == "" {
-		b.WriteString(dimStyle.Render("open: $SHELL (default)") + "\n\n")
+		b.WriteString(dimStyle.Render("open: $SHELL (default)") + "\n")
 	} else {
-		b.WriteString(dimStyle.Render("open: ") + m.openCmd + dimStyle.Render("  ("+m.openScope+")") + "\n\n")
+		b.WriteString(dimStyle.Render("open: ") + m.openCmd + dimStyle.Render("  ("+m.openScope+")") + "\n")
 	}
+	if m.hookCmd != "" {
+		b.WriteString(dimStyle.Render("post-create: ") + m.hookCmd + dimStyle.Render("  ("+m.hookScope+")") + "\n")
+	}
+	b.WriteString("\n")
 
 	switch m.mode {
 	case modeCreate:
@@ -572,6 +657,14 @@ func (m model) viewList() string {
 		b.WriteString("\n" + boxStyle.Width(m.boxWidth()).Render(errStyle.Render(m.lastErr)+"\n"+
 			warnStyle.Render("Force delete branch "+m.target.Branch+"?")+"\n"+
 			keyStyle.Render("y")+" delete (-D)  "+keyStyle.Render("n")+" keep branch") + "\n")
+	case modeConfirmFixLinks:
+		rows := []string{warnStyle.Render("Replace these symlinks with copy-on-write clones of their targets?")}
+		for _, rel := range m.target.Links {
+			target, _ := filepath.EvalSymlinks(filepath.Join(m.target.Path, rel))
+			rows = append(rows, "  "+rel+dimStyle.Render(" → "+tildify(target)))
+		}
+		rows = append(rows, keyStyle.Render("y")+" replace  "+keyStyle.Render("n")+" cancel")
+		b.WriteString("\n" + boxStyle.Width(m.boxWidth()).Render(strings.Join(rows, "\n")) + "\n")
 	}
 	return b.String()
 }
@@ -592,6 +685,9 @@ func (m model) flags(wt Worktree) string {
 	}
 	if wt.Prunable {
 		f = append(f, errStyle.Render("missing (p to prune)"))
+	}
+	if n := len(wt.Links); n > 0 {
+		f = append(f, warnStyle.Render(fmt.Sprintf("⚠ %d external symlink(s) (l to fix)", n)))
 	}
 	return strings.Join(f, " ")
 }
@@ -625,9 +721,13 @@ func (m model) viewSetCommand() string {
 	if m.cmdGlobal {
 		scope = "global"
 	}
+	title := "Open command"
+	if m.cmdKey == postCreateKey {
+		title = "Post-create hook (runs after .worktreeinclude files are copied)"
+	}
 	rows := []string{
-		titleStyle.Render("Open command"),
-		dimStyle.Render("Runs in the worktree dir. Placeholders: {path} {branch} {name}; env: $TG_PATH $TG_BRANCH"),
+		titleStyle.Render(title),
+		dimStyle.Render("Runs in the worktree dir. Placeholders: {path} {branch} {name} {main}; env: $TG_PATH $TG_BRANCH $TG_MAIN"),
 		"",
 		m.cmdInput.View(),
 		"",
@@ -640,7 +740,7 @@ func (m model) viewHelp() string {
 	var keys [][2]string
 	switch m.mode {
 	case modeList:
-		keys = [][2]string{{"↑↓", "move"}, {"enter", "open"}, {"n", "new"}, {"d", "delete"}, {"c", "set command"}, {"p", "prune"}, {"r", "refresh"}, {"q", "quit"}}
+		keys = [][2]string{{"↑↓", "move"}, {"enter", "open"}, {"n", "new"}, {"d", "delete"}, {"c", "open cmd"}, {"h", "post-create"}, {"l", "fix links"}, {"p", "prune"}, {"r", "refresh"}, {"q", "quit"}}
 	case modeCreate:
 		keys = [][2]string{{"tab", "next field"}, {"enter", "create"}, {"esc", "cancel"}}
 	case modeSetCommand:
@@ -664,6 +764,11 @@ func branchLabel(wt Worktree) string {
 	default:
 		return "(detached)"
 	}
+}
+
+func lastLine(s string) string {
+	s = strings.TrimSpace(s)
+	return s[strings.LastIndex(s, "\n")+1:]
 }
 
 func pad(s string, w int) string {
