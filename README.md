@@ -5,7 +5,7 @@ A TUI for managing git worktrees. Run it from inside any repo.
 ## Install
 
 ```sh
-go install .        # or: go build -o ~/bin/tree-goblin .
+go install .        # installs to ~/go/bin (must be on PATH)
 ```
 
 ## Keys
